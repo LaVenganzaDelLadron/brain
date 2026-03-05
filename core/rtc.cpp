@@ -7,6 +7,7 @@ const uint8_t SDA_PIN = 21;
 const uint8_t SCL_PIN_PRIMARY = 22;
 const uint8_t SCL_PIN_FALLBACK = 23;
 unsigned long lastRtcRetryMs = 0;
+unsigned long lastTimePrintMs = 0;
 
 byte scanI2C() {
   byte count = 0;
@@ -57,19 +58,34 @@ void rtcStartup() {
 
 void getTime() {
   if (!rtcReady) {
-    Serial.println("RTC unavailable, check wiring/pins/module type");
     if (millis() - lastRtcRetryMs > 10000) {
       lastRtcRetryMs = millis();
-      Serial.println("Retrying RTC detection...");
+      Serial.println("RTC unavailable, retrying detection...");
       rtcStartup();
     }
-    delay(1000);
     return;
   }
+
+  if (millis() - lastTimePrintMs < 1000) {
+    return;
+  }
+  lastTimePrintMs = millis();
 
   DateTime now = rtc.now();
   Serial.printf("%d/%d/%d %d:%d:%d\n",
                 now.year(), now.month(), now.day(),
                 now.hour(), now.minute(), now.second());
-  delay(1000);
+}
+
+bool rtcHasTime() {
+  return rtcReady;
+}
+
+uint32_t rtcUnixTime() {
+  if (!rtcReady) {
+    return 0;
+  }
+
+  DateTime now = rtc.now();
+  return static_cast<uint32_t>(now.unixtime());
 }

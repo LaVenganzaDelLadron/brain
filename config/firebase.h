@@ -17,5 +17,16 @@
 void processData(AsyncResult &aResult);
 void firebaseStartup();
 void runFirebase();
+bool firebaseReady();
+bool firebaseUpsertController(const String &deviceCode,
+                              const String &penCode,
+                              bool online,
+                              uint32_t lastSeenEpoch,
+                              const String &source);
+bool firebaseLogEvent(const String &deviceCode,
+                      const String &penCode,
+                      const String &eventType,
+                      const String &payload,
+                      uint32_t eventEpoch);
 
 #endif

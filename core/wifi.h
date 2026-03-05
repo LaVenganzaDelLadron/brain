@@ -4,5 +4,6 @@
 #include <WiFi.h>
 
 void startup();
+void runControllerHub();
 
 #endif

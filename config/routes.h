@@ -4,9 +4,9 @@
 #include <Arduino.h>
 
 // Base URL (global constant)
-const String BASE_URL = "https://shapi-qq0p.onrender.com";
+inline const String BASE_URL = "https://shapi-qq0p.onrender.com";
 
-String endpointUrl(String path) {
+inline String endpointUrl(String path) {
   String baseUrl = BASE_URL;
   if (baseUrl.endsWith("/")) {
     baseUrl.remove(baseUrl.length() - 1);
@@ -17,7 +17,10 @@ String endpointUrl(String path) {
   return baseUrl + path;
 }
 
-const String PG_TELEMETRY = endpointUrl("api/telemetry");
-const String PG_STATUS = endpointUrl("api/status");
+inline const String PG_TELEMETRY = endpointUrl("api/telemetry");
+inline const String PG_STATUS = endpointUrl("api/status");
+inline const String PG_CONTROLLER_REGISTER = endpointUrl("api/controllers/register");
+inline const String PG_CONTROLLER_HEARTBEAT = endpointUrl("api/controllers/heartbeat");
+inline const String PG_COMMAND_EVENT = endpointUrl("api/controllers/command-event");
 
 #endif

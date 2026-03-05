@@ -10,15 +10,6 @@ using AsyncClient = AsyncClientClass;
 AsyncClient aClient(ssl_client);
 RealtimeDatabase Database;
 
-// Timer variables for sending data every 10 seconds
-unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 10000; // 10 seconds in milliseconds
-
-// Variables to send to the database
-int intValue = 0;
-float floatValue = 0.01;
-String stringValue = "";
-
 void firebaseStartup() {
 // Configure SSL client
   ssl_client.setInsecure();
@@ -50,18 +41,26 @@ void processData(AsyncResult &aResult) {
 
 void runFirebase() {
   app.loop();
-  if (app.ready()){ 
-    unsigned long currentTime = millis();
-    if (currentTime - lastSendTime >= sendInterval){
-      lastSendTime = currentTime;
-      
-      stringValue = "value_" + String(currentTime);
-      Database.set<String>(aClient, "/test/string", stringValue, processData, "RTDB_Send_String");
-      Database.set<int>(aClient, "/test/int", intValue, processData, "RTDB_Send_Int");
-      intValue++;
+}
 
-      floatValue = 0.01 + random(0, 100);
-      Database.set<float>(aClient, "/test/float", floatValue, processData, "RTDB_Send_Float");
-    }
-  }
+bool firebaseReady() {
+  return app.ready();
+}
+
+bool firebaseUpsertController(const String &deviceCode, const String &penCode, bool online, uint32_t lastSeenEpoch, const String &source) {
+  (void)deviceCode;
+  (void)penCode;
+  (void)online;
+  (void)lastSeenEpoch;
+  (void)source;
+  return false;
+}
+
+bool firebaseLogEvent(const String &deviceCode, const String &penCode, const String &eventType, const String &payload, uint32_t eventEpoch) {
+  (void)deviceCode;
+  (void)penCode;
+  (void)eventType;
+  (void)payload;
+  (void)eventEpoch;
+  return false;
 }
