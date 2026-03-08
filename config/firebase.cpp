@@ -1,6 +1,10 @@
 #include "firebase.h"
 #include "firebase_secrets.h"
+#if defined(ESP8266)
+#include <ESP8266WiFi.h>
+#else
 #include <WiFi.h>
+#endif
 
 UserAuth user_auth(Web_API_KEY, USER_EMAIL, USER_PASS);
 
@@ -72,19 +76,38 @@ bool firebaseReady() {
 }
 
 bool firebaseUpsertController(const String &deviceCode, const String &penCode, bool online, uint32_t lastSeenEpoch, const String &source) {
-  (void)deviceCode;
-  (void)penCode;
-  (void)online;
-  (void)lastSeenEpoch;
-  (void)source;
-  return false;
+  if (!firebaseReady()) {
+    return false;
+  }
+
+  if (deviceCode.length() == 0 || penCode.length() == 0 || source.length() == 0) {
+    return false;
+  }
+
+  const String path = "/controllers/" + deviceCode;
+  const String json = String("{\"device_code\":\"") + deviceCode +
+                      "\",\"pen_code\":\"" + penCode +
+                      "\",\"online\":" + (online ? "true" : "false") +
+                      ",\"last_seen_epoch\":" + String(lastSeenEpoch) +
+                      ",\"last_seen_source\":\"" + source + "\"}";
+
+  const bool status = Database.set<object_t>(aClient, path, object_t(json));
+  if (!status) {
+    Serial.printf("Firebase upsert failed: %s\n", path.c_str());
+  }
+  return status;
 }
 
 bool firebaseLogEvent(const String &deviceCode, const String &penCode, const String &eventType, const String &payload, uint32_t eventEpoch) {
-  (void)deviceCode;
-  (void)penCode;
-  (void)eventType;
-  (void)payload;
-  (void)eventEpoch;
-  return false;
+  if (!firebaseReady()) {
+    return false;
+  }
+
+  const String path = "/controller_events/" + deviceCode + "/" + String(eventEpoch);
+  const String json = String("{\"device_code\":\"") + deviceCode +
+                      "\",\"pen_code\":\"" + penCode +
+                      "\",\"event_type\":\"" + eventType +
+                      "\",\"payload\":\"" + payload +
+                      "\",\"event_epoch\":" + String(eventEpoch) + "}";
+  return Database.set<object_t>(aClient, path, object_t(json));
 }

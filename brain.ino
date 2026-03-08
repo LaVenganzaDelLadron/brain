@@ -15,5 +15,5 @@ void loop() {
   runControllerHub();
   getTime();
   runFirebase();
-  delay(1000);
+  delay(50);
 }
