@@ -1,5 +1,6 @@
 #include "firebase.h"
 #include "firebase_secrets.h"
+#include <WiFi.h>
 
 UserAuth user_auth(Web_API_KEY, USER_EMAIL, USER_PASS);
 
@@ -9,8 +10,15 @@ WiFiClientSecure ssl_client;
 using AsyncClient = AsyncClientClass;
 AsyncClient aClient(ssl_client);
 RealtimeDatabase Database;
+static bool firebaseInitialized = false;
+static unsigned long lastFirebaseInitAttemptMs = 0;
+static const unsigned long FIREBASE_INIT_RETRY_MS = 5000;
 
 void firebaseStartup() {
+  if (firebaseInitialized) {
+    return;
+  }
+
 // Configure SSL client
   ssl_client.setInsecure();
   ssl_client.setConnectionTimeout(1000);
@@ -20,6 +28,7 @@ void firebaseStartup() {
   initializeApp(aClient, app, getAuth(user_auth), processData, "authTask");
   app.getApp<RealtimeDatabase>(Database);
   Database.url(DATABASE_URL);
+  firebaseInitialized = true;
 }
 
 void processData(AsyncResult &aResult) {
@@ -40,11 +49,26 @@ void processData(AsyncResult &aResult) {
 }
 
 void runFirebase() {
+  if (!firebaseInitialized) {
+    if (WiFi.status() != WL_CONNECTED) {
+      return;
+    }
+
+    const unsigned long now = millis();
+    if (now - lastFirebaseInitAttemptMs < FIREBASE_INIT_RETRY_MS) {
+      return;
+    }
+
+    lastFirebaseInitAttemptMs = now;
+    firebaseStartup();
+    return;
+  }
+
   app.loop();
 }
 
 bool firebaseReady() {
-  return app.ready();
+  return firebaseInitialized && app.ready();
 }
 
 bool firebaseUpsertController(const String &deviceCode, const String &penCode, bool online, uint32_t lastSeenEpoch, const String &source) {

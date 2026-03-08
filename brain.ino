@@ -5,13 +5,15 @@
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+  Serial.println("System Starting...");
   startup();
   rtcStartup();
-  firebaseStartup();
 }
 
 void loop() {
   runControllerHub();
   getTime();
   runFirebase();
+  delay(1000);
 }
