@@ -4,7 +4,7 @@
 #include <Arduino.h>
 
 // Base URL (global constant)
-inline const String BASE_URL = "https://shapi-qq0p.onrender.com";
+inline const String BASE_URL = "https://shapi-m80t.onrender.com";
 
 inline String endpointUrl(String path) {
   String baseUrl = BASE_URL;

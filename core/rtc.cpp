@@ -89,3 +89,17 @@ uint32_t rtcUnixTime() {
   DateTime now = rtc.now();
   return static_cast<uint32_t>(now.unixtime());
 }
+
+bool rtcGetIsoTimestamp(String &out) {
+  if (!rtcReady) {
+    return false;
+  }
+
+  DateTime now = rtc.now();
+  char buffer[21];
+  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           now.year(), now.month(), now.day(),
+           now.hour(), now.minute(), now.second());
+  out = buffer;
+  return true;
+}

@@ -1,6 +1,7 @@
 #include "wifi.h"
 #include "../config/firebase.h"
 #include "rtc.h"
+#include "../functions/device.h"
 #include <ArduinoJson.h>
 
 const char *ssid = "Virus";
@@ -23,11 +24,20 @@ unsigned long lastOnlineWriteRetryMs = 0;
 bool controllerMarkedOnline = false;
 bool pendingOnlineWrite = false;
 unsigned long lastStaRetryMs = 0;
+String lastPostedDeviceCode;
+String lastPostedPenCode;
+String pendingPostDeviceCode;
+String pendingPostPenCode;
+bool pendingDevicePost = false;
+unsigned long lastDevicePostAttemptMs = 0;
+unsigned long devicePostBackoffMs = 0;
 
 static const unsigned long CONTROLLER_OFFLINE_TIMEOUT_MS = 12000;
 static const unsigned long OFFLINE_RETRY_MS = 1000;
 static const unsigned long ONLINE_RETRY_MS = 1000;
 static const unsigned long STA_RETRY_MS = 3000;
+static const unsigned long DEVICE_POST_BACKOFF_START_MS = 2000;
+static const unsigned long DEVICE_POST_BACKOFF_MAX_MS = 30000;
 
 uint32_t currentEpoch() {
   const uint32_t rtcEpoch = rtcUnixTime();
@@ -35,6 +45,65 @@ uint32_t currentEpoch() {
     return rtcEpoch;
   }
   return 1700000000UL + static_cast<uint32_t>(millis() / 1000UL);
+}
+
+void scheduleDevicePost(const String &deviceCode, const String &penCode) {
+  if (deviceCode.length() == 0 || penCode.length() == 0) {
+    return;
+  }
+
+  if (!pendingDevicePost &&
+      deviceCode == lastPostedDeviceCode &&
+      penCode == lastPostedPenCode) {
+    return;
+  }
+
+  if (pendingDevicePost &&
+      deviceCode == pendingPostDeviceCode &&
+      penCode == pendingPostPenCode) {
+    return;
+  }
+
+  pendingDevicePost = true;
+  pendingPostDeviceCode = deviceCode;
+  pendingPostPenCode = penCode;
+  devicePostBackoffMs = DEVICE_POST_BACKOFF_START_MS;
+  lastDevicePostAttemptMs = 0;
+  Serial.printf("Queued device post for %s / %s\n", deviceCode.c_str(), penCode.c_str());
+}
+
+void processPendingDevicePost(unsigned long now) {
+  if (!pendingDevicePost) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (lastDevicePostAttemptMs != 0 &&
+      now - lastDevicePostAttemptMs < devicePostBackoffMs) {
+    return;
+  }
+
+  lastDevicePostAttemptMs = now;
+  Serial.printf("Posting device to API: %s / %s\n",
+                pendingPostDeviceCode.c_str(),
+                pendingPostPenCode.c_str());
+
+  const bool ok = postDeviceToApi(pendingPostDeviceCode, pendingPostPenCode);
+  if (ok) {
+    lastPostedDeviceCode = pendingPostDeviceCode;
+    lastPostedPenCode = pendingPostPenCode;
+    pendingDevicePost = false;
+    devicePostBackoffMs = DEVICE_POST_BACKOFF_START_MS;
+    Serial.printf("Device post succeeded for %s\n", lastPostedDeviceCode.c_str());
+  } else {
+    if (devicePostBackoffMs < DEVICE_POST_BACKOFF_MAX_MS) {
+      devicePostBackoffMs = min(devicePostBackoffMs * 2, DEVICE_POST_BACKOFF_MAX_MS);
+    }
+    Serial.printf("Device post failed; retry in %lu ms\n", devicePostBackoffMs);
+  }
 }
 
 bool parseControllerHeartbeat(const String &payload,
@@ -136,6 +205,7 @@ void runControllerHub() {
       lastHeartbeatRxMs = now;
       controllerMarkedOnline = true;
       pendingOnlineWrite = true;
+      scheduleDevicePost(deviceCode, penCode);
 
       const bool ok = firebaseUpsertController(deviceCode, penCode, true, heartbeatEpoch, source);
       if (ok) {
@@ -176,6 +246,8 @@ void runControllerHub() {
       }
     }
   }
+
+  processPendingDevicePost(now);
 }
 
 void startup() {
