@@ -15,6 +15,7 @@ using AsyncClient = AsyncClientClass;
 AsyncClient aClient(ssl_client);
 RealtimeDatabase Database;
 static bool firebaseInitialized = false;
+static bool firebaseReadyLogged = false;
 static unsigned long lastFirebaseInitAttemptMs = 0;
 static const unsigned long FIREBASE_INIT_RETRY_MS = 5000;
 
@@ -33,6 +34,7 @@ void firebaseStartup() {
   app.getApp<RealtimeDatabase>(Database);
   Database.url(DATABASE_URL);
   firebaseInitialized = true;
+  firebaseReadyLogged = false;
 }
 
 void processData(AsyncResult &aResult) {
@@ -69,6 +71,11 @@ void runFirebase() {
   }
 
   app.loop();
+
+  if (app.ready() && !firebaseReadyLogged) {
+    firebaseReadyLogged = true;
+    Serial.println("Firebase ready");
+  }
 }
 
 bool firebaseReady() {

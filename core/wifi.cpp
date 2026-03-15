@@ -4,8 +4,8 @@
 #include "../functions/device.h"
 #include <ArduinoJson.h>
 
-const char *ssid = "Virus";
-const char *password = "BreakingCode!=5417";
+const char *ssid = "caleb_5G";
+const char *password = "caleb121617";
 
 const char *ap_ssid = "SmartHogWifi";
 const char *ap_password = "12345678";
@@ -13,6 +13,7 @@ const char *ap_password = "12345678";
 static const uint16_t CONTROLLER_PORT = 3333;
 WiFiServer controllerServer(CONTROLLER_PORT);
 WiFiClient controllerClient;
+bool controllerWasConnected = false;
 String controllerRxLine;
 String lastDeviceCode;
 String lastPenCode;
@@ -23,7 +24,6 @@ unsigned long lastOfflineWriteRetryMs = 0;
 unsigned long lastOnlineWriteRetryMs = 0;
 bool controllerMarkedOnline = false;
 bool pendingOnlineWrite = false;
-unsigned long lastStaRetryMs = 0;
 String lastPostedDeviceCode;
 String lastPostedPenCode;
 String pendingPostDeviceCode;
@@ -31,11 +31,16 @@ String pendingPostPenCode;
 bool pendingDevicePost = false;
 unsigned long lastDevicePostAttemptMs = 0;
 unsigned long devicePostBackoffMs = 0;
+unsigned long lastStaAttemptMs = 0;
+unsigned long staBackoffMs = 0;
+bool staWasConnected = false;
+wl_status_t lastStaStatus = WL_IDLE_STATUS;
 
 static const unsigned long CONTROLLER_OFFLINE_TIMEOUT_MS = 12000;
 static const unsigned long OFFLINE_RETRY_MS = 1000;
 static const unsigned long ONLINE_RETRY_MS = 1000;
-static const unsigned long STA_RETRY_MS = 3000;
+static const unsigned long STA_BACKOFF_START_MS = 3000;
+static const unsigned long STA_BACKOFF_MAX_MS = 30000;
 static const unsigned long DEVICE_POST_BACKOFF_START_MS = 2000;
 static const unsigned long DEVICE_POST_BACKOFF_MAX_MS = 30000;
 
@@ -106,6 +111,45 @@ void processPendingDevicePost(unsigned long now) {
   }
 }
 
+void maintainWiFiConnection() {
+  const unsigned long now = millis();
+  const wl_status_t status = WiFi.status();
+
+  if (status != lastStaStatus) {
+    Serial.printf("WiFi status: %d\n", status);
+    lastStaStatus = status;
+  }
+
+  if (status == WL_CONNECTED) {
+    if (!staWasConnected) {
+      staWasConnected = true;
+      staBackoffMs = STA_BACKOFF_START_MS;
+      Serial.print("WiFi connected, IP: ");
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+
+  if (staWasConnected) {
+    staWasConnected = false;
+    Serial.println("WiFi disconnected; attempting reconnect");
+  }
+
+  if (now - lastStaAttemptMs < staBackoffMs) {
+    return;
+  }
+
+  lastStaAttemptMs = now;
+  Serial.printf("WiFi reconnecting (backoff %lu ms)\n", staBackoffMs);
+  WiFi.disconnect();
+  delay(50);
+  WiFi.begin(ssid, password);
+
+  if (staBackoffMs < STA_BACKOFF_MAX_MS) {
+    staBackoffMs = min(staBackoffMs * 2, STA_BACKOFF_MAX_MS);
+  }
+}
+
 bool parseControllerHeartbeat(const String &payload,
                               String &deviceCode,
                               String &penCode,
@@ -141,15 +185,11 @@ bool parseControllerHeartbeat(const String &payload,
 void runControllerHub() {
   const unsigned long now = millis();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    if (now - lastStaRetryMs >= STA_RETRY_MS) {
-      lastStaRetryMs = now;
-      Serial.println("Router uplink disconnected, retrying STA...");
-      WiFi.reconnect();
-    }
-  }
-
   if (!controllerClient || !controllerClient.connected()) {
+    if (controllerClient && controllerWasConnected) {
+      controllerWasConnected = false;
+      Serial.println("Controller disconnected");
+    }
     if (controllerClient) {
       controllerClient.stop();
       controllerRxLine = "";
@@ -158,6 +198,7 @@ void runControllerHub() {
     WiFiClient incoming = controllerServer.available();
     if (incoming) {
       controllerClient = incoming;
+      controllerWasConnected = true;
       controllerRxLine = "";
       controllerClient.setNoDelay(true);
       Serial.printf("Controller connected: %s\n", controllerClient.remoteIP().toString().c_str());
@@ -252,6 +293,10 @@ void runControllerHub() {
 
 void startup() {
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(true);
+  staBackoffMs = STA_BACKOFF_START_MS;
+  staWasConnected = false;
+  lastStaAttemptMs = 0;
   WiFi.softAP(ap_ssid, ap_password);
   controllerServer.begin();
 

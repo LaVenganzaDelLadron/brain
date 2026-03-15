@@ -9,5 +9,6 @@
 
 void startup();
 void runControllerHub();
+void maintainWiFiConnection();
 
 #endif
