@@ -4,8 +4,8 @@
 #include "../functions/device.h"
 #include <ArduinoJson.h>
 
-const char *ssid = "caleb_5G";
-const char *password = "caleb121617";
+const char *ssid = "Virus";
+const char *password = "BreakingCode!=5417";
 
 const char *ap_ssid = "SmartHogWifi";
 const char *ap_password = "12345678";
@@ -24,6 +24,17 @@ unsigned long lastOfflineWriteRetryMs = 0;
 unsigned long lastOnlineWriteRetryMs = 0;
 bool controllerMarkedOnline = false;
 bool pendingOnlineWrite = false;
+uint32_t pendingOnlineWriteId = 0;
+uint32_t pendingOfflineWriteId = 0;
+uint32_t pendingDevicePostId = 0;
+uint32_t pendingOnlineWriteEpoch = 0;
+uint32_t pendingOfflineWriteEpoch = 0;
+String pendingOnlineWriteSource;
+String pendingOfflineWriteSource;
+String pendingOnlineWriteDevice;
+String pendingOnlineWritePen;
+String pendingOfflineWriteDevice;
+String pendingOfflineWritePen;
 String lastPostedDeviceCode;
 String lastPostedPenCode;
 String pendingPostDeviceCode;
@@ -77,7 +88,64 @@ void scheduleDevicePost(const String &deviceCode, const String &penCode) {
   Serial.printf("Queued device post for %s / %s\n", deviceCode.c_str(), penCode.c_str());
 }
 
+void processFirebaseWriteResults() {
+  if (pendingOnlineWriteId != 0) {
+    bool success = false;
+    if (firebaseCheckControllerWrite(pendingOnlineWriteId, &success)) {
+      if (success) {
+        if (pendingOnlineWriteDevice == lastDeviceCode &&
+            pendingOnlineWritePen == lastPenCode &&
+            pendingOnlineWriteEpoch == lastSeenEpoch &&
+            pendingOnlineWriteSource == lastSeenSource) {
+          pendingOnlineWrite = false;
+        }
+        Serial.printf("Controller online update confirmed: %s\n", pendingOnlineWriteDevice.c_str());
+      } else {
+        Serial.printf("Controller online update failed: %s\n", pendingOnlineWriteDevice.c_str());
+      }
+      pendingOnlineWriteId = 0;
+    }
+  }
+
+  if (pendingOfflineWriteId != 0) {
+    bool success = false;
+    if (firebaseCheckControllerWrite(pendingOfflineWriteId, &success)) {
+      if (success) {
+        controllerMarkedOnline = false;
+        pendingOnlineWrite = false;
+        lastSeenEpoch = pendingOfflineWriteEpoch;
+        lastSeenSource = pendingOfflineWriteSource;
+        Serial.printf("Controller marked offline: %s\n", pendingOfflineWriteDevice.c_str());
+      } else {
+        Serial.printf("Controller offline update failed: %s\n", pendingOfflineWriteDevice.c_str());
+      }
+      pendingOfflineWriteId = 0;
+    }
+  }
+}
+
 void processPendingDevicePost(unsigned long now) {
+  if (pendingDevicePostId != 0) {
+    bool success = false;
+    if (devicePostResult(pendingDevicePostId, &success)) {
+      pendingDevicePostId = 0;
+      if (success) {
+        lastPostedDeviceCode = pendingPostDeviceCode;
+        lastPostedPenCode = pendingPostPenCode;
+        pendingDevicePost = false;
+        devicePostBackoffMs = DEVICE_POST_BACKOFF_START_MS;
+        Serial.printf("Device post succeeded for %s\n", lastPostedDeviceCode.c_str());
+      } else {
+        if (devicePostBackoffMs < DEVICE_POST_BACKOFF_MAX_MS) {
+          devicePostBackoffMs = min(devicePostBackoffMs * 2, DEVICE_POST_BACKOFF_MAX_MS);
+        }
+        Serial.printf("Device post failed; retry in %lu ms\n", devicePostBackoffMs);
+      }
+    } else {
+      return;
+    }
+  }
+
   if (!pendingDevicePost) {
     return;
   }
@@ -91,23 +159,24 @@ void processPendingDevicePost(unsigned long now) {
     return;
   }
 
+  if (pendingDevicePostId != 0) {
+    return;
+  }
+
   lastDevicePostAttemptMs = now;
-  Serial.printf("Posting device to API: %s / %s\n",
+  Serial.printf("Queueing device post: %s / %s\n",
                 pendingPostDeviceCode.c_str(),
                 pendingPostPenCode.c_str());
 
-  const bool ok = postDeviceToApi(pendingPostDeviceCode, pendingPostPenCode);
-  if (ok) {
-    lastPostedDeviceCode = pendingPostDeviceCode;
-    lastPostedPenCode = pendingPostPenCode;
-    pendingDevicePost = false;
-    devicePostBackoffMs = DEVICE_POST_BACKOFF_START_MS;
-    Serial.printf("Device post succeeded for %s\n", lastPostedDeviceCode.c_str());
+  uint32_t requestId = 0;
+  const bool queued = queueDevicePost(pendingPostDeviceCode, pendingPostPenCode, &requestId);
+  if (queued) {
+    pendingDevicePostId = requestId;
   } else {
     if (devicePostBackoffMs < DEVICE_POST_BACKOFF_MAX_MS) {
       devicePostBackoffMs = min(devicePostBackoffMs * 2, DEVICE_POST_BACKOFF_MAX_MS);
     }
-    Serial.printf("Device post failed; retry in %lu ms\n", devicePostBackoffMs);
+    Serial.printf("Device post queue failed; retry in %lu ms\n", devicePostBackoffMs);
   }
 }
 
@@ -184,6 +253,7 @@ bool parseControllerHeartbeat(const String &payload,
 
 void runControllerHub() {
   const unsigned long now = millis();
+  processFirebaseWriteResults();
 
   if (!controllerClient || !controllerClient.connected()) {
     if (controllerClient && controllerWasConnected) {
@@ -248,11 +318,18 @@ void runControllerHub() {
       pendingOnlineWrite = true;
       scheduleDevicePost(deviceCode, penCode);
 
-      const bool ok = firebaseUpsertController(deviceCode, penCode, true, heartbeatEpoch, source);
-      if (ok) {
-        pendingOnlineWrite = false;
+      if (pendingOnlineWriteId == 0) {
+        uint32_t requestId = 0;
+        const bool queued = firebaseQueueUpsertController(deviceCode, penCode, true, heartbeatEpoch, source, &requestId);
+        if (queued) {
+          pendingOnlineWriteId = requestId;
+          pendingOnlineWriteEpoch = heartbeatEpoch;
+          pendingOnlineWriteSource = source;
+          pendingOnlineWriteDevice = deviceCode;
+          pendingOnlineWritePen = penCode;
+        }
+        Serial.printf("Controller heartbeat %s for %s\n", queued ? "queued" : "queue_failed", deviceCode.c_str());
       }
-      Serial.printf("Controller heartbeat %s for %s\n", ok ? "stored" : "failed", deviceCode.c_str());
     }
   }
 
@@ -265,24 +342,43 @@ void runControllerHub() {
       }
 
       if (now - lastOfflineWriteRetryMs >= OFFLINE_RETRY_MS) {
-        lastOfflineWriteRetryMs = now;
-        const uint32_t offlineEpoch = currentEpoch();
-        const bool ok = firebaseUpsertController(lastDeviceCode, lastPenCode, false, offlineEpoch, "brain_timeout");
-        if (ok) {
-          controllerMarkedOnline = false;
-          pendingOnlineWrite = false;
-          lastSeenEpoch = offlineEpoch;
-          lastSeenSource = "brain_timeout";
-          Serial.printf("Controller marked offline: %s\n", lastDeviceCode.c_str());
+        if (pendingOfflineWriteId == 0) {
+          lastOfflineWriteRetryMs = now;
+          const uint32_t offlineEpoch = currentEpoch();
+          uint32_t requestId = 0;
+          const bool queued = firebaseQueueUpsertController(lastDeviceCode,
+                                                            lastPenCode,
+                                                            false,
+                                                            offlineEpoch,
+                                                            "brain_timeout",
+                                                            &requestId);
+          if (queued) {
+            pendingOfflineWriteId = requestId;
+            pendingOfflineWriteEpoch = offlineEpoch;
+            pendingOfflineWriteSource = "brain_timeout";
+            pendingOfflineWriteDevice = lastDeviceCode;
+            pendingOfflineWritePen = lastPenCode;
+          }
         }
       }
     } else if (pendingOnlineWrite && lastSeenEpoch > 0 && lastSeenSource.length() > 0) {
       if (now - lastOnlineWriteRetryMs >= ONLINE_RETRY_MS) {
-        lastOnlineWriteRetryMs = now;
-        const bool ok = firebaseUpsertController(lastDeviceCode, lastPenCode, true, lastSeenEpoch, lastSeenSource);
-        if (ok) {
-          pendingOnlineWrite = false;
-          Serial.printf("Controller online state synced: %s\n", lastDeviceCode.c_str());
+        if (pendingOnlineWriteId == 0) {
+          lastOnlineWriteRetryMs = now;
+          uint32_t requestId = 0;
+          const bool queued = firebaseQueueUpsertController(lastDeviceCode,
+                                                            lastPenCode,
+                                                            true,
+                                                            lastSeenEpoch,
+                                                            lastSeenSource,
+                                                            &requestId);
+          if (queued) {
+            pendingOnlineWriteId = requestId;
+            pendingOnlineWriteEpoch = lastSeenEpoch;
+            pendingOnlineWriteSource = lastSeenSource;
+            pendingOnlineWriteDevice = lastDeviceCode;
+            pendingOnlineWritePen = lastPenCode;
+          }
         }
       }
     }

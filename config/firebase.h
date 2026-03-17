@@ -18,6 +18,20 @@ void processData(AsyncResult &aResult);
 void firebaseStartup();
 void runFirebase();
 bool firebaseReady();
+bool firebaseQueueUpsertController(const String &deviceCode,
+                                   const String &penCode,
+                                   bool online,
+                                   uint32_t lastSeenEpoch,
+                                   const String &source,
+                                   uint32_t *requestIdOut);
+bool firebaseQueueLogEvent(const String &deviceCode,
+                           const String &penCode,
+                           const String &eventType,
+                           const String &payload,
+                           uint32_t eventEpoch,
+                           uint32_t *requestIdOut);
+bool firebaseCheckControllerWrite(uint32_t requestId, bool *successOut);
+bool firebaseCheckLogEventWrite(uint32_t requestId, bool *successOut);
 bool firebaseUpsertController(const String &deviceCode,
                               const String &penCode,
                               bool online,

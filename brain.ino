@@ -9,7 +9,7 @@
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(1500);
   Serial.println("System Starting...");
 
 #if defined(ESP32)
@@ -27,6 +27,6 @@ void loop() {
   runControllerHub();
   runFirebase();
   getTime();
-  delay(10);
+  delay(1500);
   yield();
 }
