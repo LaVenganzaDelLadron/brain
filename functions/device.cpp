@@ -33,6 +33,9 @@ struct DevicePostResult {
 
 static const size_t DEVICE_QUEUE_LEN = 8;
 static const size_t DEVICE_RESULT_LEN = 8;
+static const unsigned long DEVICE_API_POST_BACKOFF_START_MS = 2000;
+static const unsigned long DEVICE_API_POST_BACKOFF_MAX_MS = 30000;
+static const unsigned long DEVICE_API_DELAY_SLICE_MS = 50;
 static uint32_t deviceNextRequestId = 1;
 
 #if defined(ESP32)
@@ -82,15 +85,48 @@ static bool deviceFindResult(uint32_t requestId, bool *successOut) {
   return found;
 }
 
+static void deviceRetryDelay(unsigned long delayMs) {
+  unsigned long remainingMs = delayMs;
+  while (remainingMs > 0) {
+    const unsigned long sliceMs = remainingMs > DEVICE_API_DELAY_SLICE_MS ? DEVICE_API_DELAY_SLICE_MS : remainingMs;
+#if defined(ESP32)
+    vTaskDelay(pdMS_TO_TICKS(sliceMs));
+#else
+    delay(sliceMs);
+    yield();
+#endif
+    remainingMs -= sliceMs;
+  }
+}
+
 #if defined(ESP32)
 static bool deviceQueuePush(DevicePostItem *item) {
   if (!deviceQueue) {
     deviceQueue = xQueueCreate(DEVICE_QUEUE_LEN, sizeof(DevicePostItem *));
     if (!deviceQueue) {
+      Serial.println("Device queue creation failed");
       return false;
     }
   }
-  return xQueueSend(deviceQueue, &item, 0) == pdTRUE;
+
+  if (xQueueSend(deviceQueue, &item, 0) == pdTRUE) {
+    return true;
+  }
+
+  DevicePostItem *dropped = nullptr;
+  if (xQueueReceive(deviceQueue, &dropped, 0) == pdTRUE && dropped) {
+    Serial.printf("Device queue full, overwriting oldest request %lu with %lu\n",
+                  static_cast<unsigned long>(dropped->id),
+                  static_cast<unsigned long>(item->id));
+    deviceRecordResult(dropped->id, false);
+    delete dropped;
+    if (xQueueSend(deviceQueue, &item, 0) == pdTRUE) {
+      return true;
+    }
+  }
+
+  Serial.printf("Device queue push failed for request %lu\n", static_cast<unsigned long>(item->id));
+  return false;
 }
 
 static DevicePostItem *deviceQueuePop(uint32_t timeoutMs) {
@@ -146,52 +182,80 @@ bool postDeviceToApi(const String &deviceCode, const String &penCode) {
     return false;
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Device post aborted: Wi-Fi not connected");
-    return false;
-  }
+  unsigned long backoffMs = DEVICE_API_POST_BACKOFF_START_MS;
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  while (true) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.printf("Device post waiting for Wi-Fi: %s (retry in %lu ms)\n",
+                    deviceCode.c_str(),
+                    backoffMs);
+      deviceRetryDelay(backoffMs);
+      backoffMs = min(backoffMs * 2, DEVICE_API_POST_BACKOFF_MAX_MS);
+      continue;
+    }
 
-  HTTPClient https;
-  const String url = endpointUrl("/device/add/");
-  if (!https.begin(client, url)) {
-    Serial.println("Device post failed: HTTPS begin failed");
-    return false;
-  }
-  https.setTimeout(5000);
+    WiFiClientSecure client;
+    client.setInsecure();
 
-  https.addHeader("Content-Type", "application/json");
+    HTTPClient https;
+    if (!https.begin(client, PG_CONTROLLER_REGISTER)) {
+      Serial.printf("Device post begin failed for %s (retry in %lu ms)\n",
+                    deviceCode.c_str(),
+                    backoffMs);
+      deviceRetryDelay(backoffMs);
+      backoffMs = min(backoffMs * 2, DEVICE_API_POST_BACKOFF_MAX_MS);
+      continue;
+    }
 
-  StaticJsonDocument<192> doc;
-  doc["device_code"] = deviceCode;
-  doc["pen_code"] = penCode;
+    https.setTimeout(5000);
+    https.addHeader("Content-Type", "application/json");
 
-  String isoTimestamp;
-  if (rtcGetIsoTimestamp(isoTimestamp)) {
-    doc["date"] = isoTimestamp;
-  } else {
-    Serial.println("RTC time unavailable; sending payload without date");
-  }
+    StaticJsonDocument<192> doc;
+    doc["device_code"] = deviceCode;
+    doc["pen_code"] = penCode;
 
-  String payload;
-  serializeJson(doc, payload);
+    String isoTimestamp;
+    if (rtcGetIsoTimestamp(isoTimestamp)) {
+      doc["date"] = isoTimestamp;
+    }
 
-  const int httpCode = https.POST(payload);
-  if (httpCode <= 0) {
-    Serial.printf("Device post failed: %s\n", https.errorToString(httpCode).c_str());
+    String payload;
+    serializeJson(doc, payload);
+
+    const int httpCode = https.POST(payload);
+    if (httpCode == 400) {
+      Serial.printf("Device already registered: %s\n", deviceCode.c_str());
+      https.end();
+      return true;
+    }
+
+    if (httpCode == 200 || httpCode == 201) {
+      Serial.printf("Device post succeeded for %s (HTTP %d)\n", deviceCode.c_str(), httpCode);
+      https.end();
+      return true;
+    }
+
+    if (httpCode <= 0) {
+      Serial.printf("Device post transport failure for %s: %s (retry in %lu ms)\n",
+                    deviceCode.c_str(),
+                    https.errorToString(httpCode).c_str(),
+                    backoffMs);
+    } else {
+      Serial.printf("Device post failed for %s with HTTP %d (retry in %lu ms)\n",
+                    deviceCode.c_str(),
+                    httpCode,
+                    backoffMs);
+      const String responseBody = https.getString();
+      if (responseBody.length() > 0) {
+        Serial.println("Device post response body:");
+        Serial.println(responseBody);
+      }
+    }
+
     https.end();
-    return false;
+    deviceRetryDelay(backoffMs);
+    backoffMs = min(backoffMs * 2, DEVICE_API_POST_BACKOFF_MAX_MS);
   }
-
-  Serial.printf("Device post response code: %d\n", httpCode);
-  const String responseBody = https.getString();
-  Serial.println("Device post response body:");
-  Serial.println(responseBody);
-
-  https.end();
-  return httpCode == 201;
 }
 
 bool queueDevicePost(const String &deviceCode, const String &penCode, uint32_t *requestIdOut) {
@@ -202,6 +266,7 @@ bool queueDevicePost(const String &deviceCode, const String &penCode, uint32_t *
 
   DevicePostItem *item = new (std::nothrow) DevicePostItem();
   if (!item) {
+    Serial.println("Device queue allocation failed");
     return false;
   }
 
@@ -210,6 +275,7 @@ bool queueDevicePost(const String &deviceCode, const String &penCode, uint32_t *
   item->penCode = penCode;
 
   if (!deviceQueuePush(item)) {
+    Serial.printf("Device queue failed for %s\n", deviceCode.c_str());
     delete item;
     return false;
   }

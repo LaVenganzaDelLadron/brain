@@ -5,6 +5,7 @@
 #else
 #include <WiFi.h>
 #endif
+#include <ArduinoJson.h>
 #include <new>
 
 #if defined(ESP32)
@@ -24,7 +25,14 @@ RealtimeDatabase Database;
 static bool firebaseInitialized = false;
 static bool firebaseReadyLogged = false;
 static unsigned long lastFirebaseInitAttemptMs = 0;
+static volatile unsigned long lastFirebaseWriteSuccessMs = 0;
+static volatile unsigned long lastFirebaseReadyMs = 0;
 static const unsigned long FIREBASE_INIT_RETRY_MS = 5000;
+static const unsigned long FIREBASE_READY_WATCHDOG_MS = 10000;
+static const unsigned long FIREBASE_FORCE_RETRY_MS = 10000;
+static const unsigned long FIREBASE_WRITE_BACKOFF_START_MS = 500;
+static const unsigned long FIREBASE_WRITE_BACKOFF_MAX_MS = 8000;
+static const unsigned long FIREBASE_DELAY_SLICE_MS = 50;
 
 enum FirebaseWriteType : uint8_t { FB_WRITE_CONTROLLER = 0, FB_WRITE_EVENT = 1 };
 
@@ -103,18 +111,116 @@ static bool firebaseFindResult(uint32_t requestId, FirebaseWriteType type, bool 
   return found;
 }
 
+static void firebaseMarkReady() {
+  lastFirebaseReadyMs = millis();
+  if (!firebaseReadyLogged) {
+    firebaseReadyLogged = true;
+    Serial.println("Firebase ready");
+  }
+}
+
+static void firebasePumpApp() {
+  if (!firebaseInitialized) {
+    return;
+  }
+
+  app.loop();
+  if (app.ready()) {
+    firebaseMarkReady();
+  }
+}
+
+static bool firebaseNoRecentSuccess(unsigned long now, unsigned long thresholdMs) {
+  const unsigned long lastSuccessMs = lastFirebaseWriteSuccessMs;
+  if (lastSuccessMs == 0) {
+    return firebaseInitialized && now - lastFirebaseInitAttemptMs >= thresholdMs;
+  }
+  return now - lastSuccessMs >= thresholdMs;
+}
+
+static bool firebaseReadyStalled(unsigned long now) {
+  if (!firebaseInitialized) {
+    return false;
+  }
+
+  if (lastFirebaseReadyMs == 0) {
+    return now - lastFirebaseInitAttemptMs >= FIREBASE_READY_WATCHDOG_MS;
+  }
+
+  return now - lastFirebaseReadyMs >= FIREBASE_READY_WATCHDOG_MS;
+}
+
+static void firebaseRetryDelay(unsigned long delayMs) {
+  unsigned long remainingMs = delayMs;
+  while (remainingMs > 0) {
+    firebasePumpApp();
+    const unsigned long sliceMs = remainingMs > FIREBASE_DELAY_SLICE_MS ? FIREBASE_DELAY_SLICE_MS : remainingMs;
+#if defined(ESP32)
+    vTaskDelay(pdMS_TO_TICKS(sliceMs));
+#else
+    delay(sliceMs);
+    yield();
+#endif
+    remainingMs -= sliceMs;
+  }
+}
+
+static void firebaseResetApp(const char *reason) {
+  const unsigned long now = millis();
+  if (!firebaseInitialized || now - lastFirebaseInitAttemptMs < FIREBASE_INIT_RETRY_MS) {
+    return;
+  }
+
+  Serial.printf("Firebase watchdog reset: %s\n", reason);
+  aClient.stopAsync(true);
+  Database.resetApp();
+  deinitializeApp(app);
+  firebaseInitialized = false;
+  firebaseReadyLogged = false;
+  lastFirebaseReadyMs = 0;
+  lastFirebaseInitAttemptMs = now;
+}
+
 static bool firebaseQueuePush(FirebaseWriteItem *item) {
 #if defined(ESP32)
   if (!firebaseQueue) {
     firebaseQueue = xQueueCreate(FIREBASE_QUEUE_LEN, sizeof(FirebaseWriteItem *));
     if (!firebaseQueue) {
+      Serial.println("Firebase queue creation failed");
       return false;
     }
   }
-  return xQueueSend(firebaseQueue, &item, 0) == pdTRUE;
+
+  if (xQueueSend(firebaseQueue, &item, 0) == pdTRUE) {
+    return true;
+  }
+
+  FirebaseWriteItem *dropped = nullptr;
+  if (xQueueReceive(firebaseQueue, &dropped, 0) == pdTRUE && dropped) {
+    Serial.printf("Firebase queue full, overwriting oldest request %lu with %lu\n",
+                  static_cast<unsigned long>(dropped->id),
+                  static_cast<unsigned long>(item->id));
+    firebaseRecordResult(dropped->id, dropped->type, false);
+    delete dropped;
+    if (xQueueSend(firebaseQueue, &item, 0) == pdTRUE) {
+      return true;
+    }
+  }
+
+  Serial.printf("Firebase queue push failed for request %lu\n", static_cast<unsigned long>(item->id));
+  return false;
 #else
   if (firebaseQueueCount >= FIREBASE_QUEUE_LEN) {
-    return false;
+    FirebaseWriteItem *dropped = firebaseQueueRing[firebaseQueueHead];
+    firebaseQueueHead = (firebaseQueueHead + 1) % FIREBASE_QUEUE_LEN;
+    firebaseQueueCount--;
+    if (dropped) {
+      Serial.printf("Firebase queue full, overwriting oldest request %lu with %lu\n",
+                    static_cast<unsigned long>(dropped->id),
+                    static_cast<unsigned long>(item->id));
+      firebaseRecordResult(dropped->id, dropped->type, false);
+      delete dropped;
+    }
   }
   const size_t idx = (firebaseQueueHead + firebaseQueueCount) % FIREBASE_QUEUE_LEN;
   firebaseQueueRing[idx] = item;
@@ -146,48 +252,127 @@ static FirebaseWriteItem *firebaseQueuePop(uint32_t timeoutMs) {
 }
 
 static bool firebasePerformControllerWrite(const FirebaseWriteItem &item) {
-  if (!firebaseReady()) {
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
   if (item.deviceCode.length() == 0 || item.penCode.length() == 0 || item.source.length() == 0) {
+    Serial.println("Firebase controller write aborted: missing required fields");
     return false;
   }
 
   const String path = "/controllers/" + item.deviceCode;
-  const String json = String("{\"device_code\":\"") + item.deviceCode +
-                      "\",\"pen_code\":\"" + item.penCode +
-                      "\",\"online\":" + (item.online ? "true" : "false") +
-                      ",\"last_seen_epoch\":" + String(item.lastSeenEpoch) +
-                      ",\"last_seen_source\":\"" + item.source + "\"}";
+  unsigned long backoffMs = FIREBASE_WRITE_BACKOFF_START_MS;
 
-  const bool status = Database.set<object_t>(aClient, path, object_t(json));
-  if (!status) {
-    Serial.printf("Firebase upsert failed: %s\n", path.c_str());
+  while (true) {
+    firebasePumpApp();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.printf("Firebase controller write waiting for Wi-Fi: %s (retry in %lu ms)\n",
+                    item.deviceCode.c_str(),
+                    backoffMs);
+      firebaseRetryDelay(backoffMs);
+      backoffMs = min(backoffMs * 2, FIREBASE_WRITE_BACKOFF_MAX_MS);
+      continue;
+    }
+
+    if (!firebaseReady()) {
+      if (firebaseReadyStalled(millis())) {
+        firebaseResetApp("app not ready during controller write");
+      }
+      Serial.printf("Firebase controller write waiting for readiness: %s (retry in %lu ms)\n",
+                    item.deviceCode.c_str(),
+                    backoffMs);
+      firebaseRetryDelay(backoffMs);
+      backoffMs = min(backoffMs * 2, FIREBASE_WRITE_BACKOFF_MAX_MS);
+      continue;
+    }
+
+    StaticJsonDocument<192> doc;
+    doc["device_code"] = item.deviceCode;
+    doc["pen_code"] = item.penCode;
+    doc["online"] = item.online;
+    doc["last_seen_epoch"] = item.lastSeenEpoch;
+    doc["last_seen_source"] = item.source;
+
+    String json;
+    serializeJson(doc, json);
+
+    if (Database.set<object_t>(aClient, path, object_t(json))) {
+      lastFirebaseWriteSuccessMs = millis();
+      return true;
+    }
+
+    Serial.printf("Firebase controller write failed: %s (retry in %lu ms)\n",
+                  path.c_str(),
+                  backoffMs);
+    if (firebaseNoRecentSuccess(millis(), FIREBASE_FORCE_RETRY_MS)) {
+      firebaseResetApp("no successful write for >10 seconds");
+      backoffMs = FIREBASE_WRITE_BACKOFF_START_MS;
+    } else if (backoffMs < FIREBASE_WRITE_BACKOFF_MAX_MS) {
+      backoffMs = min(backoffMs * 2, FIREBASE_WRITE_BACKOFF_MAX_MS);
+    }
+
+    firebaseRetryDelay(backoffMs);
   }
-  return status;
 }
 
 static bool firebasePerformLogEventWrite(const FirebaseWriteItem &item) {
-  if (!firebaseReady()) {
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
   if (item.deviceCode.length() == 0 || item.eventType.length() == 0) {
+    Serial.println("Firebase event write aborted: missing required fields");
     return false;
   }
 
   const String path = "/controller_events/" + item.deviceCode + "/" + String(item.eventEpoch);
-  const String json = String("{\"device_code\":\"") + item.deviceCode +
-                      "\",\"pen_code\":\"" + item.penCode +
-                      "\",\"event_type\":\"" + item.eventType +
-                      "\",\"payload\":\"" + item.payload +
-                      "\",\"event_epoch\":" + String(item.eventEpoch) + "}";
-  return Database.set<object_t>(aClient, path, object_t(json));
+  unsigned long backoffMs = FIREBASE_WRITE_BACKOFF_START_MS;
+
+  while (true) {
+    firebasePumpApp();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.printf("Firebase event write waiting for Wi-Fi: %s (retry in %lu ms)\n",
+                    path.c_str(),
+                    backoffMs);
+      firebaseRetryDelay(backoffMs);
+      backoffMs = min(backoffMs * 2, FIREBASE_WRITE_BACKOFF_MAX_MS);
+      continue;
+    }
+
+    if (!firebaseReady()) {
+      if (firebaseReadyStalled(millis())) {
+        firebaseResetApp("app not ready during event write");
+      }
+      Serial.printf("Firebase event write waiting for readiness: %s (retry in %lu ms)\n",
+                    path.c_str(),
+                    backoffMs);
+      firebaseRetryDelay(backoffMs);
+      backoffMs = min(backoffMs * 2, FIREBASE_WRITE_BACKOFF_MAX_MS);
+      continue;
+    }
+
+    StaticJsonDocument<320> doc;
+    doc["device_code"] = item.deviceCode;
+    doc["pen_code"] = item.penCode;
+    doc["event_type"] = item.eventType;
+    doc["payload"] = item.payload;
+    doc["event_epoch"] = item.eventEpoch;
+
+    String json;
+    serializeJson(doc, json);
+
+    if (Database.set<object_t>(aClient, path, object_t(json))) {
+      lastFirebaseWriteSuccessMs = millis();
+      return true;
+    }
+
+    Serial.printf("Firebase event write failed: %s (retry in %lu ms)\n",
+                  path.c_str(),
+                  backoffMs);
+    if (firebaseNoRecentSuccess(millis(), FIREBASE_FORCE_RETRY_MS)) {
+      firebaseResetApp("no successful write for >10 seconds");
+      backoffMs = FIREBASE_WRITE_BACKOFF_START_MS;
+    } else if (backoffMs < FIREBASE_WRITE_BACKOFF_MAX_MS) {
+      backoffMs = min(backoffMs * 2, FIREBASE_WRITE_BACKOFF_MAX_MS);
+    }
+
+    firebaseRetryDelay(backoffMs);
+  }
 }
 
 #if defined(ESP32)
@@ -195,19 +380,13 @@ static void firebaseTaskMain(void *param) {
   (void)param;
   const TickType_t idleDelay = pdMS_TO_TICKS(20);
   while (true) {
+    firebasePumpApp();
+
+    if (WiFi.status() == WL_CONNECTED && firebaseReadyStalled(millis())) {
+      firebaseResetApp("worker loop stalled");
+    }
+
     if (!firebaseInitialized) {
-      vTaskDelay(idleDelay);
-      continue;
-    }
-
-    app.loop();
-
-    if (app.ready() && !firebaseReadyLogged) {
-      firebaseReadyLogged = true;
-      Serial.println("Firebase ready");
-    }
-
-    if (!app.ready() || WiFi.status() != WL_CONNECTED) {
       vTaskDelay(idleDelay);
       continue;
     }
@@ -266,6 +445,7 @@ void firebaseStartup() {
   Database.url(DATABASE_URL);
   firebaseInitialized = true;
   firebaseReadyLogged = false;
+  lastFirebaseReadyMs = 0;
 
 #if defined(ESP32)
   firebaseStartWorkerIfNeeded();
@@ -308,10 +488,10 @@ void runFirebase() {
 #if defined(ESP32)
   firebaseStartWorkerIfNeeded();
 #else
-  app.loop();
-  if (app.ready() && !firebaseReadyLogged) {
-    firebaseReadyLogged = true;
-    Serial.println("Firebase ready");
+  firebasePumpApp();
+  if (WiFi.status() == WL_CONNECTED && firebaseReadyStalled(millis())) {
+    firebaseResetApp("main loop stalled");
+    return;
   }
 
   FirebaseWriteItem *item = firebaseQueuePop(0);
@@ -344,6 +524,7 @@ bool firebaseQueueUpsertController(const String &deviceCode,
 
   FirebaseWriteItem *item = new (std::nothrow) FirebaseWriteItem();
   if (!item) {
+    Serial.println("Firebase controller queue allocation failed");
     return false;
   }
 
@@ -356,6 +537,7 @@ bool firebaseQueueUpsertController(const String &deviceCode,
   item->source = source;
 
   if (!firebaseQueuePush(item)) {
+    Serial.printf("Firebase controller queue failed for %s\n", deviceCode.c_str());
     delete item;
     return false;
   }
@@ -378,6 +560,7 @@ bool firebaseQueueLogEvent(const String &deviceCode,
 
   FirebaseWriteItem *item = new (std::nothrow) FirebaseWriteItem();
   if (!item) {
+    Serial.println("Firebase event queue allocation failed");
     return false;
   }
 
@@ -390,6 +573,7 @@ bool firebaseQueueLogEvent(const String &deviceCode,
   item->eventEpoch = eventEpoch;
 
   if (!firebaseQueuePush(item)) {
+    Serial.printf("Firebase event queue failed for %s\n", deviceCode.c_str());
     delete item;
     return false;
   }
@@ -422,4 +606,12 @@ bool firebaseLogEvent(const String &deviceCode,
                       const String &payload,
                       uint32_t eventEpoch) {
   return firebaseQueueLogEvent(deviceCode, penCode, eventType, payload, eventEpoch, nullptr);
+}
+
+unsigned long firebaseLastSuccessfulUpdateMs() {
+  return lastFirebaseWriteSuccessMs;
+}
+
+bool firebaseWriteStale(unsigned long thresholdMs) {
+  return firebaseNoRecentSuccess(millis(), thresholdMs);
 }

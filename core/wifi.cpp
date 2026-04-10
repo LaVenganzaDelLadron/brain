@@ -4,8 +4,8 @@
 #include "../functions/device.h"
 #include <ArduinoJson.h>
 
-const char *ssid = "Virus";
-const char *password = "BreakingCode!=5417";
+const char *ssid = "caleb_5G";
+const char *password = "caleb121617";
 
 const char *ap_ssid = "SmartHogWifi";
 const char *ap_password = "12345678";
@@ -35,11 +35,12 @@ String pendingOnlineWriteDevice;
 String pendingOnlineWritePen;
 String pendingOfflineWriteDevice;
 String pendingOfflineWritePen;
-String lastPostedDeviceCode;
-String lastPostedPenCode;
+String registeredDeviceCode;
+String registeredPenCode;
 String pendingPostDeviceCode;
 String pendingPostPenCode;
 bool pendingDevicePost = false;
+bool deviceRegistered = false;
 unsigned long lastDevicePostAttemptMs = 0;
 unsigned long devicePostBackoffMs = 0;
 unsigned long lastStaAttemptMs = 0;
@@ -54,6 +55,7 @@ static const unsigned long STA_BACKOFF_START_MS = 3000;
 static const unsigned long STA_BACKOFF_MAX_MS = 30000;
 static const unsigned long DEVICE_POST_BACKOFF_START_MS = 2000;
 static const unsigned long DEVICE_POST_BACKOFF_MAX_MS = 30000;
+static const unsigned long FIREBASE_STALE_RETRY_MS = 10000;
 
 uint32_t currentEpoch() {
   const uint32_t rtcEpoch = rtcUnixTime();
@@ -63,20 +65,28 @@ uint32_t currentEpoch() {
   return 1700000000UL + static_cast<uint32_t>(millis() / 1000UL);
 }
 
+static bool isRegisteredDevice(const String &deviceCode, const String &penCode) {
+  return deviceRegistered &&
+         deviceCode == registeredDeviceCode &&
+         penCode == registeredPenCode;
+}
+
 void scheduleDevicePost(const String &deviceCode, const String &penCode) {
   if (deviceCode.length() == 0 || penCode.length() == 0) {
     return;
   }
 
-  if (!pendingDevicePost &&
-      deviceCode == lastPostedDeviceCode &&
-      penCode == lastPostedPenCode) {
+  if (isRegisteredDevice(deviceCode, penCode)) {
     return;
   }
 
   if (pendingDevicePost &&
       deviceCode == pendingPostDeviceCode &&
       penCode == pendingPostPenCode) {
+    return;
+  }
+
+  if (pendingDevicePostId != 0) {
     return;
   }
 
@@ -130,11 +140,12 @@ void processPendingDevicePost(unsigned long now) {
     if (devicePostResult(pendingDevicePostId, &success)) {
       pendingDevicePostId = 0;
       if (success) {
-        lastPostedDeviceCode = pendingPostDeviceCode;
-        lastPostedPenCode = pendingPostPenCode;
+        registeredDeviceCode = pendingPostDeviceCode;
+        registeredPenCode = pendingPostPenCode;
+        deviceRegistered = true;
         pendingDevicePost = false;
         devicePostBackoffMs = DEVICE_POST_BACKOFF_START_MS;
-        Serial.printf("Device post succeeded for %s\n", lastPostedDeviceCode.c_str());
+        Serial.printf("Device registered for %s\n", registeredDeviceCode.c_str());
       } else {
         if (devicePostBackoffMs < DEVICE_POST_BACKOFF_MAX_MS) {
           devicePostBackoffMs = min(devicePostBackoffMs * 2, DEVICE_POST_BACKOFF_MAX_MS);
@@ -211,7 +222,7 @@ void maintainWiFiConnection() {
   lastStaAttemptMs = now;
   Serial.printf("WiFi reconnecting (backoff %lu ms)\n", staBackoffMs);
   WiFi.disconnect();
-  delay(50);
+  yield();
   WiFi.begin(ssid, password);
 
   if (staBackoffMs < STA_BACKOFF_MAX_MS) {
@@ -254,6 +265,13 @@ bool parseControllerHeartbeat(const String &payload,
 void runControllerHub() {
   const unsigned long now = millis();
   processFirebaseWriteResults();
+
+  if (controllerMarkedOnline &&
+      lastDeviceCode.length() > 0 &&
+      lastSeenEpoch > 0 &&
+      firebaseWriteStale(FIREBASE_STALE_RETRY_MS)) {
+    pendingOnlineWrite = true;
+  }
 
   if (!controllerClient || !controllerClient.connected()) {
     if (controllerClient && controllerWasConnected) {
@@ -358,6 +376,8 @@ void runControllerHub() {
             pendingOfflineWriteSource = "brain_timeout";
             pendingOfflineWriteDevice = lastDeviceCode;
             pendingOfflineWritePen = lastPenCode;
+          } else {
+            Serial.printf("Controller offline queue failed for %s\n", lastDeviceCode.c_str());
           }
         }
       }
@@ -378,6 +398,8 @@ void runControllerHub() {
             pendingOnlineWriteSource = lastSeenSource;
             pendingOnlineWriteDevice = lastDeviceCode;
             pendingOnlineWritePen = lastPenCode;
+          } else {
+            Serial.printf("Controller online queue failed for %s\n", lastDeviceCode.c_str());
           }
         }
       }

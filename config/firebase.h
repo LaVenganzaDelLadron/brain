@@ -42,5 +42,7 @@ bool firebaseLogEvent(const String &deviceCode,
                       const String &eventType,
                       const String &payload,
                       uint32_t eventEpoch);
+unsigned long firebaseLastSuccessfulUpdateMs();
+bool firebaseWriteStale(unsigned long thresholdMs = 10000);
 
 #endif
