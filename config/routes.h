@@ -19,7 +19,7 @@ inline String endpointUrl(String path) {
 
 inline const String PG_TELEMETRY = endpointUrl("api/telemetry");
 inline const String PG_STATUS = endpointUrl("api/status");
-inline const String PG_CONTROLLER_REGISTER = endpointUrl("api/controllers/register");
+inline const String PG_CONTROLLER_REGISTER = endpointUrl("device/add/");
 inline const String PG_CONTROLLER_HEARTBEAT = endpointUrl("api/controllers/heartbeat");
 inline const String PG_COMMAND_EVENT = endpointUrl("api/controllers/command-event");
 
