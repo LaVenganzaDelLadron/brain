@@ -1,12 +1,14 @@
-#include "firebase.h"
+#include "firebase_internal.h"
 #include "firebase_secrets.h"
+
+#include <ArduinoJson.h>
+#include <new>
+
 #if defined(ESP8266)
 #include <ESP8266WiFi.h>
 #else
 #include <WiFi.h>
 #endif
-#include <ArduinoJson.h>
-#include <new>
 
 #if defined(ESP32)
 #include <freertos/FreeRTOS.h>
@@ -16,12 +18,13 @@
 
 UserAuth user_auth(Web_API_KEY, USER_EMAIL, USER_PASS);
 
-// Firebase components
 FirebaseApp app;
 WiFiClientSecure ssl_client;
-using AsyncClient = AsyncClientClass;
 AsyncClient aClient(ssl_client);
 RealtimeDatabase Database;
+WiFiClientSecure scheduler_ssl_client;
+AsyncClient schedulerClient(scheduler_ssl_client);
+RealtimeDatabase SchedulerDatabase;
 static bool firebaseInitialized = false;
 static bool firebaseReadyLogged = false;
 static unsigned long lastFirebaseInitAttemptMs = 0;
@@ -438,11 +441,16 @@ void firebaseStartup() {
   ssl_client.setInsecure();
   ssl_client.setConnectionTimeout(1000);
   ssl_client.setHandshakeTimeout(5);
+  scheduler_ssl_client.setInsecure();
+  scheduler_ssl_client.setConnectionTimeout(1000);
+  scheduler_ssl_client.setHandshakeTimeout(5);
 
   // Initialize Firebase
   initializeApp(aClient, app, getAuth(user_auth), processData, "authTask");
   app.getApp<RealtimeDatabase>(Database);
+  app.getApp<RealtimeDatabase>(SchedulerDatabase);
   Database.url(DATABASE_URL);
+  SchedulerDatabase.url(DATABASE_URL);
   firebaseInitialized = true;
   firebaseReadyLogged = false;
   lastFirebaseReadyMs = 0;
@@ -506,6 +514,8 @@ void runFirebase() {
     delete item;
   }
 #endif
+
+  firebaseRunBrainLoop();
 }
 
 bool firebaseReady() {

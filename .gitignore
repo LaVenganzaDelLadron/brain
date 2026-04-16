@@ -1,2 +1,3 @@
 # Local Firebase secrets
 config/firebase_secrets.h
+config/wifi_secrets.h
